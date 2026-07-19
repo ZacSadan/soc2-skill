@@ -1,0 +1,165 @@
+# SOC2 scanner configuration. Non-secret settings only - credentials always
+# live under secrets/ (gitignored) and are referenced here only by path.
+#
+# Company-identifying values (workspace names, hardcoded manual-review URLs,
+# firewall/bucket name-highlighting patterns) live in
+# secrets/soc2.config.private.yaml instead of this file - that file is
+# gitignored (alongside the other credentials in secrets/), this one is
+# meant to be safe to make public. See the fields below with a "-> private
+# config" note for what goes there:
+#   bitbucket.workspaces, bitbucket.manual_review_urls, bitbucket.account_email,
+#   gcp.manual_review_urls, gcp.firewall_name_highlights,
+#   gcp.storage_bucket_collapsible_groups, confluence.cloud_id,
+#   confluence.main_space, confluence.account_email, gsuite.delegated_admin_email
+version: 1
+
+gcp:
+  enabled: true
+  service_account_key_path: "secrets/gcp-service-account.json"
+  project_ids: []              # empty = use project_id from the key file
+  # manual_review_urls, firewall_name_highlights, and
+  # storage_bucket_collapsible_groups all -> private config (see header note)
+  checks:
+    iam_bindings: true
+    service_account_keys: true
+    firewall_rules: true
+    ssh_keys: true
+    api_keys: true             # requires the API Keys API (apikeys.googleapis.com) enabled
+    scc_findings: true         # best-effort; commonly skipped without org-level access
+    iam_recommender: true      # best-effort; requires Recommender API enabled
+    usage_metrics: true        # best-effort; requires Monitoring API + roles/monitoring.viewer
+    cloud_asset_public_bindings: true   # requires roles/cloudasset.viewer
+    kms_key_rotation: true               # requires roles/cloudkms.viewer
+    cloud_sql_instances: true            # requires roles/cloudsql.viewer
+    secret_manager_secrets: true         # requires roles/secretmanager.viewer
+    logging_sinks: true                  # requires roles/logging.viewer
+    artifact_registry_repos: true        # requires roles/artifactregistry.reader
+    pubsub_public_topics: true           # requires roles/pubsub.viewer
+    gke_clusters: true                   # requires roles/container.viewer
+    dns_zones: true                       # requires roles/dns.reader
+    storage_bucket_config: true          # requires storage.buckets.list/get (roles/storage.admin, or legacyBucketReader at project scope)
+    org_policies: true                    # requires roles/orgpolicy.policyViewer
+  sensitive_ports: [22, 3389, 3306, 5432]
+  key_age_warn_days: 90
+  key_age_critical_days: 180
+
+bitbucket:
+  enabled: true
+  # Dedicated soc2-skill Atlassian account token (Basic auth), replacing the
+  # old workspace-scoped Bearer token - confirmed live to regress nothing
+  # and additionally unlock Account SSH Keys (previously blocked outright
+  # for Bearer auth, not just a scope gap). See references/bitbucket_setup.md.
+  token_path: "secrets/id-atlassian-bitbucket-token.txt"
+  auth_mode: "basic_email"     # auto | basic_email | bearer
+  # account_email is a literal fallback (the real value normally lives in
+  # secrets/soc2.config.private.yaml, itself gitignored) - account_email_path
+  # is only needed if that identity should instead come from its own
+  # separate gitignored file rather than being set inline.
+  account_email: null
+  account_email_path: "secrets/delegated-admin-email.txt"
+  # Which workspace(s) to scan - company-specific, so the real value lives in
+  # secrets/soc2.config.private.yaml (gitignored) rather than here. Empty
+  # means "try auto-discovery", which this project's token type can't do
+  # (see references/bitbucket_setup.md) - that's why the private file pins
+  # an explicit workspace instead.
+  workspaces: []
+  include_repo_permissions: true
+  include_deploy_keys: true
+  include_webhooks: true
+  include_branch_restrictions: true
+  # Account SSH keys - Bitbucket rejects this endpoint outright for Bearer
+  # (access-token) auth ("not accessible by this authentication mechanism"),
+  # so this will 403 for every member with the token above; may work under
+  # auth_mode: basic_email instead. A 403 is recorded as a skipped check
+  # per account rather than failing the scan (see SKILL.md).
+  include_account_ssh_keys: true
+  # Project-level Access Keys (Project settings > Access keys in the UI) -
+  # needs both `project` and `project:admin` scope; the token above is
+  # missing `project:admin` so this will 403 until that scope is added.
+  include_project_access_keys: true
+
+confluence:
+  enabled: true
+  token_path: "secrets/id-atlassian-confluence-token.txt"
+  # account_email is a literal fallback (the real value normally lives in
+  # secrets/soc2.config.private.yaml, itself gitignored) - account_email_path
+  # is only needed if that identity should instead come from its own
+  # separate gitignored file rather than being set inline.
+  account_email: null
+  account_email_path: "secrets/delegated-admin-email.txt"
+  # cloud_id -> private config (company-identifying; see header note above)
+  checks:
+    spaces: true
+
+trello:
+  enabled: true
+  credentials_path: "secrets/trello-credentials.json"
+  organizations: []            # empty = auto-discover
+
+aws:
+  enabled: true
+  credentials_path: "secrets/aws-access-keys.csv"   # CSV from IAM > Users > Security credentials > Create access key
+  # IAM is global (scanned regardless of this setting); EC2/API Gateway/
+  # Security Hub/Access Analyzer are region-scoped - only this one region
+  # is scanned, not the whole account.
+  region: "us-east-1"
+  checks:
+    iam_users: true
+    iam_roles: true
+    iam_bindings: true
+    root_account: true          # global; MFA/access-key status of the root user (iam:GetAccountSummary)
+    access_advisor: true        # best-effort; async per-user jobs, gives up on a stalled job rather than blocking the scan
+    security_groups: true
+    ec2_key_pairs: true
+    s3_bucket_exposure: true    # global; ACL/policy/Block-Public-Access status per bucket
+    api_gateway_keys: true
+    security_hub: true          # best-effort; commonly skipped if Security Hub isn't enabled
+    guardduty: true             # best-effort; commonly skipped if no detector is enabled in this region
+    access_analyzer: true       # best-effort; commonly skipped if no analyzer is configured
+    resource_explorer: true     # best-effort; needs ViewOnlyAccess (SecurityAudit doesn't grant resource-explorer-2:*) and an admin-enabled index
+    password_policy: true       # global; iam:GetAccountPasswordPolicy
+    ebs_default_encryption: true
+    vpc_flow_logs: true
+    cloudtrail: true            # global API but region-scoped trail visibility; SecurityAudit covers cloudtrail:Describe*/Get*
+    config_recorder: true       # best-effort; commonly absent if AWS Config isn't enabled in this region
+    kms_key_rotation: true
+    rds_instances: true
+  sensitive_ports: [22, 3389, 3306, 5432]
+  key_age_warn_days: 90
+  key_age_critical_days: 180
+
+gsuite:
+  enabled: true
+  # Reuses the same GCP service-account key already used for `gcp:` above -
+  # domain-wide delegation is a separate grant on top of that same key, not
+  # a new credential. See references/gsuite_setup.md.
+  service_account_key_path: "secrets/gcp-service-account.json"
+  # The Workspace user to impersonate for Admin SDK calls (must be
+  # authorized via domain-wide delegation in the Workspace Admin Console -
+  # Security > API Controls > Domain-wide Delegation - for this service
+  # account's Client ID, scoped to the scopes listed in references/gsuite_setup.md).
+  # This is a real person's email address, not a generic setting, so it's
+  # kept out of this (committed) file - delegated_admin_email is a literal
+  # fallback (the real value normally lives in secrets/soc2.config.private.yaml,
+  # itself gitignored, shared with bitbucket.account_email/confluence.account_email
+  # - same person). delegated_admin_email_path is only needed if that
+  # identity should instead come from its own separate gitignored file.
+  delegated_admin_email: null
+  delegated_admin_email_path: "secrets/delegated-admin-email.txt"
+  checks:
+    users: true
+    admin_summary: true
+    groups: true              # requires admin.directory.group.readonly
+    org_units: true            # requires admin.directory.orgunit.readonly
+    mobile_devices: true       # requires admin.directory.device.mobile.readonly
+    suspicious_logins: true    # requires admin.reports.audit.readonly
+    oauth_app_grants: true     # requires admin.reports.audit.readonly
+  stale_login_days: 180
+  audit_lookback_days: 30      # how far back to look for suspicious logins / OAuth grants
+
+output:
+  state_dir: ".state"
+  reports_dir: "reports"
+  console_top_findings: 15
+  snapshot_retention_count: 20
+  severity_order: ["critical", "high", "medium", "low", "info"]

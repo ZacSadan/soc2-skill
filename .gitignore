@@ -1,0 +1,38 @@
+# Secrets - never commit
+/secrets/
+key-*.txt
+key-*.json
+*.pem
+*.key
+.env
+.env.*
+
+# Company-identifying config (workspace names, hardcoded URLs, name-highlight
+# patterns), kept separate from the generic, committable soc2.config.yaml -
+# lives at secrets/soc2.config.private.yaml, already covered by /secrets/ above
+
+# Scan state and generated reports - contain sensitive inventory data
+/.state/
+/reports/
+
+# Python
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Claude Code session artifacts
+.claude/scheduled_tasks.lock
+.claude/settings.local.json
+
+# Editor/OS junk
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
