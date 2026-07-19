@@ -99,10 +99,13 @@ trello:
 aws:
   enabled: true
   credentials_path: "secrets/aws-access-keys.csv"   # CSV from IAM > Users > Security credentials > Create access key
-  # IAM is global (scanned regardless of this setting); EC2/API Gateway/
-  # Security Hub/Access Analyzer are region-scoped - only this one region
-  # is scanned, not the whole account.
-  region: "us-east-1"
+  # IAM/S3/root account/CloudTrail/Resource Explorer are global (scanned
+  # regardless of this setting). EC2/API Gateway/Security Hub/GuardDuty/
+  # Access Analyzer/Config Recorder/KMS/RDS/EBS default encryption/VPC Flow
+  # Logs are region-scoped - each of those checks runs once per region
+  # listed here. Empty = auto-discover every region enabled for the account
+  # (via ec2:DescribeRegions) rather than pinning to a specific list.
+  regions: []
   checks:
     iam_users: true
     iam_roles: true

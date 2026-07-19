@@ -1449,12 +1449,14 @@ def _aws_chapters(resources):
             "resources": by_type["aws.ec2.security_group"],
             "split_disabled": False,
             "columns": [
+                ("Region", _attr("region")),
                 ("Group ID", _attr("group_id")),
                 ("Group Name", _attr("group_name")),
                 ("VPC", _attr("vpc_id")),
                 ("Ingress Rules", lambda r: "; ".join(r["attributes"].get("ingress_rules", []))),
             ],
             "columns_md": [
+                ("Region", _attr("region")),
                 ("Group ID", _attr("group_id")),
                 ("Group Name", _attr("group_name")),
                 ("VPC", _attr("vpc_id")),
@@ -1466,6 +1468,7 @@ def _aws_chapters(resources):
             "resources": by_type["aws.ec2.key_pair"],
             "split_disabled": False,
             "columns": [
+                ("Region", _attr("region")),
                 ("Key Name", _attr("key_name")),
                 ("Type", _attr("key_type")),
                 ("Fingerprint", _attr("fingerprint")),
@@ -1494,6 +1497,7 @@ def _aws_chapters(resources):
             "resources": by_type["aws.apigateway.key"],
             "split_disabled": False,
             "columns": [
+                ("Region", _attr("region")),
                 ("Name", _attr("name")),
                 ("Enabled", lambda r: "yes" if r["attributes"].get("enabled") else "no"),
                 ("Created", lambda r: (r["attributes"].get("created_date") or "")[:10]),
@@ -1505,6 +1509,7 @@ def _aws_chapters(resources):
             "resources": by_type["aws.securityhub.finding"],
             "split_disabled": False,
             "columns": [
+                ("Region", _attr("region")),
                 ("Title", _attr("title")),
                 ("Workflow State", _attr("workflow_state")),
                 ("Compliance", _attr("compliance_status")),
@@ -1515,6 +1520,7 @@ def _aws_chapters(resources):
             "resources": by_type["aws.guardduty.finding"],
             "split_disabled": False,
             "columns": [
+                ("Region", _attr("region")),
                 ("Title", _attr("title")),
                 ("Type", _attr("finding_type")),
                 ("Resource Type", _attr("resource_type")),
@@ -1525,6 +1531,7 @@ def _aws_chapters(resources):
             "resources": by_type["aws.accessanalyzer.finding"],
             "split_disabled": False,
             "columns": [
+                ("Region", _attr("region")),
                 ("Resource", _attr("resource")),
                 ("Resource Type", _attr("resource_type")),
                 ("Public", lambda r: "yes" if r["attributes"].get("is_public") else "no"),
@@ -1560,6 +1567,7 @@ def _aws_chapters(resources):
             "resources": by_type["aws.config.recorder"],
             "split_disabled": False,
             "columns": [
+                ("Region", _attr("region")),
                 ("Name", _attr("name")),
                 ("Recording", lambda r: "yes" if r["attributes"].get("recording") else "no"),
                 ("All Supported", lambda r: "yes" if r["attributes"].get("all_supported") else "no"),
@@ -1583,6 +1591,7 @@ def _aws_chapters(resources):
             "resources": by_type["aws.kms.key"],
             "split_disabled": False,
             "columns": [
+                ("Region", _attr("region")),
                 ("Key ID", _attr("key_id")),
                 ("Description", _attr("description")),
                 ("Rotation Enabled", lambda r: "yes" if r["attributes"].get("rotation_enabled") else "no"),
@@ -1593,6 +1602,7 @@ def _aws_chapters(resources):
             "resources": by_type["aws.rds.instance"],
             "split_disabled": False,
             "columns": [
+                ("Region", _attr("region")),
                 ("Identifier", _attr("identifier")),
                 ("Engine", _attr("engine")),
                 ("Publicly Accessible", lambda r: "yes" if r["attributes"].get("publicly_accessible") else "no"),
@@ -1604,6 +1614,7 @@ def _aws_chapters(resources):
             "resources": by_type["aws.ec2.ebs_default_encryption"],
             "split_disabled": False,
             "columns": [
+                ("Region", _attr("region")),
                 ("Enabled", lambda r: "yes" if r["attributes"].get("enabled") else "no"),
             ],
         },
@@ -1612,6 +1623,7 @@ def _aws_chapters(resources):
             "resources": by_type["aws.ec2.vpc"],
             "split_disabled": False,
             "columns": [
+                ("Region", _attr("region")),
                 ("VPC ID", _attr("vpc_id")),
                 ("Default", lambda r: "yes" if r["attributes"].get("is_default") else "no"),
                 ("Has Flow Log", lambda r: "yes" if r["attributes"].get("has_flow_log") else "no"),
@@ -2706,6 +2718,28 @@ def render_console(results, config):
             continue
 
         if provider == "gcp":
+            label_fn = lambda r: f"{r['type']} {r['id']}"  # noqa: E731
+            if diff.get("baseline"):
+                safe_print("  (baseline run - no prior snapshot to compare against)")
+            else:
+                total_changes = len(diff["added"]) + len(diff["removed"]) + len(diff["modified"])
+                if total_changes == 0:
+                    safe_print("  no changes since last scan")
+                else:
+                    safe_print(
+                        f"  changes since last scan: +{len(diff['added'])} added, "
+                        f"-{len(diff['removed'])} removed, {len(diff['modified'])} modified"
+                    )
+                    for r in _sorted_by_severity(diff["added"], order)[:top_n]:
+                        safe_print(f"    [ADDED] ({r.get('severity', 'info')}) {label_fn(r)}")
+                    for r in diff["removed"][:top_n]:
+                        safe_print(f"    [REMOVED] {label_fn(r)}")
+                    for r in _sorted_by_severity(diff["modified"], order)[:top_n]:
+                        changes_str = ", ".join(
+                            f"{f}: {c['before']!r} -> {c['after']!r}" for f, c in r["field_changes"].items()
+                        )
+                        safe_print(f"    [MODIFIED] ({r.get('severity', 'info')}) {label_fn(r)} :: {changes_str}")
+
             safe_print("  Manual review required (no API access to list these in GCP):")
             for url in config.get("gcp", {}).get("manual_review_urls", GCP_MANUAL_REVIEW_URLS_DEFAULT):
                 safe_print(f"    - {url}")
@@ -2853,6 +2887,27 @@ def render_markdown(results, config, scope, run_id, generated_at, snapshot_paths
             continue
 
         if provider == "gcp":
+            label_fn = lambda r: r["id"]  # noqa: E731
+            lines.append("### Changes since last scan")
+            lines.append("")
+            if diff.get("baseline"):
+                lines.append("_Baseline run — no prior snapshot to compare against._")
+            elif not (diff["added"] or diff["removed"] or diff["modified"]):
+                lines.append("_No changes._")
+            else:
+                lines.append("| Change | Severity | Type | ID | Details |")
+                lines.append("|---|---|---|---|---|")
+                for r in _sorted_by_severity(diff["added"], order):
+                    lines.append(f"| added | {_fmt_severity_md(r.get('severity', 'info'))} | {r['type']} | {label_fn(r)} | |")
+                for r in diff["removed"]:
+                    lines.append(f"| removed | {_fmt_severity_md(r.get('severity', 'info'))} | {r['type']} | {label_fn(r)} | |")
+                for r in _sorted_by_severity(diff["modified"], order):
+                    details = "; ".join(
+                        f"{f}: {c['before']!r} → {c['after']!r}" for f, c in r["field_changes"].items()
+                    )
+                    lines.append(f"| modified | {_fmt_severity_md(r.get('severity', 'info'))} | {r['type']} | {label_fn(r)} | {details} |")
+            lines.append("")
+
             lines.append("### Manual review required")
             lines.append("")
             lines.append(

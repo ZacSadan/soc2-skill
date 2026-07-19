@@ -8,9 +8,20 @@ GuardDuty / Access Analyzer findings.
 
 IAM, S3 (list_buckets), and the root account summary are global/account-wide
 and scanned once regardless of region. EC2/API Gateway/Security Hub/
-GuardDuty/Access Analyzer are region-scoped - this scanner only covers the
-single configured region (`aws.region`, default us-east-1), not every
-region in the account.
+GuardDuty/Access Analyzer/Config Recorder/KMS/RDS/EBS default encryption/VPC
+Flow Logs are region-scoped - this scanner loops each of those checks across
+every region configured in `aws.regions` (empty/unset = every region enabled
+for the account, via `ec2:DescribeRegions`), so a public security group or
+unencrypted RDS instance sitting in a region other than the account's
+"default" one is no longer invisible to the scan. Each region-scoped
+resource's `id` is prefixed with its region so the diff engine and report
+never conflate the same-shaped resource across two different regions.
+CloudTrail is the one exception kept as a single global-ish call (same as
+IAM/S3, made once against the default region) rather than looped: it already
+models multi-region coverage itself via `IsMultiRegionTrail`, and looping
+its "no trail found" degenerate case per region would falsely flag every
+region without its own trail even when a multi-region trail already covers
+it.
 
 Every check is independently try/excepted so one failing or disabled check
 never aborts the rest of the scan - failures are recorded in `errors` with a
@@ -31,9 +42,13 @@ DEFAULT_REGION = "us-east-1"
 # Binding to one of these (or having console access with no MFA, or a role
 # with a "*" trust principal) makes the entitled principal a de facto
 # account admin / public entry point - the AWS analog of HIGH_RISK_ROLES in
-# the GCP scanner. Inline policy documents are not parsed for equivalent
-# "Action: *, Resource: *" statements - out of scope for this pass.
+# the GCP scanner. This is just the fast path for AWS's own 3 built-in
+# full-access managed policies (fixed content, safe to match by name alone);
+# inline and customer-managed policies are separately content-scanned by
+# _policy_grants_full_access below, since their names are operator-chosen
+# and tell you nothing about what they actually grant.
 HIGH_RISK_MANAGED_POLICIES = {"AdministratorAccess", "PowerUserAccess", "IAMFullAccess"}
+AWS_MANAGED_POLICY_ARN_PREFIX = "arn:aws:iam::aws:policy/"
 
 
 def _client_error_reason(e):
@@ -89,6 +104,64 @@ def _policy_allows_any_principal(doc):
             if aws_principal == "*" or (isinstance(aws_principal, list) and "*" in aws_principal):
                 return True
     return False
+
+
+def _policy_grants_full_access(doc):
+    """True if any Allow statement grants unrestricted `Action: "*"` on
+    `Resource: "*"` - the JSON-document equivalent of AdministratorAccess,
+    regardless of what the policy or statement happens to be named. Catches
+    the case a name-only check misses entirely: an inline or
+    customer-managed policy named anything at all (not just the 3 AWS
+    built-in names in HIGH_RISK_MANAGED_POLICIES) that still grants full
+    account access."""
+    if not isinstance(doc, dict):
+        return False
+    statements = doc.get("Statement", [])
+    if isinstance(statements, dict):
+        statements = [statements]
+    for stmt in statements:
+        if stmt.get("Effect") != "Allow":
+            continue
+        action = stmt.get("Action")
+        actions = [action] if isinstance(action, str) else (action or [])
+        resource = stmt.get("Resource")
+        resources = [resource] if isinstance(resource, str) else (resource or [])
+        if "*" in actions and "*" in resources:
+            return True
+    return False
+
+
+def _fetch_inline_policy_document(iam, principal_type, principal_name, policy_name, errors):
+    try:
+        if principal_type == "user":
+            resp = iam.get_user_policy(UserName=principal_name, PolicyName=policy_name)
+        elif principal_type == "role":
+            resp = iam.get_role_policy(RoleName=principal_name, PolicyName=policy_name)
+        else:
+            resp = iam.get_group_policy(GroupName=principal_name, PolicyName=policy_name)
+        return resp.get("PolicyDocument")
+    except ClientError as e:
+        errors.append({
+            "check": f"iam_inline_policy_doc:{principal_type}:{principal_name}:{policy_name}",
+            "reason": _client_error_reason(e), "detail": str(e),
+        })
+        return None
+
+
+def _fetch_managed_policy_document(iam, policy_arn, errors):
+    """Customer-managed policies (unlike AWS-managed ones) aren't returned
+    by list_attached_*_policies with their document inline - a separate
+    get_policy (for the current DefaultVersionId) + get_policy_version call
+    is needed to read what the policy actually grants."""
+    try:
+        version_id = iam.get_policy(PolicyArn=policy_arn).get("Policy", {}).get("DefaultVersionId")
+        if not version_id:
+            return None
+        version = iam.get_policy_version(PolicyArn=policy_arn, VersionId=version_id)
+        return version.get("PolicyVersion", {}).get("Document")
+    except ClientError as e:
+        errors.append({"check": f"iam_managed_policy_doc:{policy_arn}", "reason": _client_error_reason(e), "detail": str(e)})
+        return None
 
 
 def scan_iam_users_and_keys(iam, key_age_warn_days, key_age_critical_days, errors):
@@ -209,21 +282,44 @@ def scan_iam_roles(iam, errors):
 def scan_iam_policy_bindings(iam, errors):
     """Mirrors the GCP IAM binding check: every managed-policy attachment
     and inline policy on every user, role, and group, so "who can do what"
-    doesn't require cross-referencing 3 separate console pages."""
+    doesn't require cross-referencing 3 separate console pages.
+
+    Severity isn't just a name lookup: the 3 AWS built-in full-access
+    policies are matched by name (cheap, their content is fixed), but every
+    inline policy and every customer-managed attached policy has its actual
+    document fetched and content-scanned via _policy_grants_full_access -
+    an operator-named policy (inline or customer-managed) that grants
+    Action:*/Resource:* is flagged regardless of what it's called."""
     resources = []
 
-    def emit(principal_type, principal_name, policy_name, policy_arn, is_inline):
-        severity = "high" if policy_name in HIGH_RISK_MANAGED_POLICIES else "info"
+    def emit(principal_type, principal_name, policy_name, policy_arn, is_inline, grants_full_access):
+        severity = "high" if grants_full_access else "info"
         resources.append({
             "type": "aws.iam.binding",
             "id": f"binding:{principal_type}:{principal_name}:{policy_name}",
             "attributes": {
                 "principal": principal_name, "principal_type": principal_type,
                 "policy_name": policy_name, "policy_arn": policy_arn,
+                "grants_full_access": grants_full_access,
             },
             "severity": severity,
             "tags": ["iam", "binding"] + (["inline"] if is_inline else []) + (["admin"] if severity == "high" else []),
         })
+
+    def emit_attached(principal_type, principal_name, p):
+        policy_name, policy_arn = p["PolicyName"], p["PolicyArn"]
+        if policy_name in HIGH_RISK_MANAGED_POLICIES:
+            grants_full_access = True
+        elif policy_arn.startswith(AWS_MANAGED_POLICY_ARN_PREFIX):
+            grants_full_access = False  # other AWS-managed policies are a known, fixed, non-admin set
+        else:
+            doc = _fetch_managed_policy_document(iam, policy_arn, errors)
+            grants_full_access = _policy_grants_full_access(doc)
+        emit(principal_type, principal_name, policy_name, policy_arn, is_inline=False, grants_full_access=grants_full_access)
+
+    def emit_inline(principal_type, principal_name, policy_name):
+        doc = _fetch_inline_policy_document(iam, principal_type, principal_name, policy_name, errors)
+        emit(principal_type, principal_name, policy_name, None, is_inline=True, grants_full_access=_policy_grants_full_access(doc))
 
     try:
         users = []
@@ -232,9 +328,9 @@ def scan_iam_policy_bindings(iam, errors):
         for user in users:
             name = user["UserName"]
             for p in iam.list_attached_user_policies(UserName=name).get("AttachedPolicies", []):
-                emit("user", name, p["PolicyName"], p["PolicyArn"], is_inline=False)
+                emit_attached("user", name, p)
             for policy_name in iam.list_user_policies(UserName=name).get("PolicyNames", []):
-                emit("user", name, policy_name, None, is_inline=True)
+                emit_inline("user", name, policy_name)
     except ClientError as e:
         errors.append({"check": "iam_user_policies", "reason": _client_error_reason(e), "detail": str(e)})
 
@@ -247,9 +343,9 @@ def scan_iam_policy_bindings(iam, errors):
             if (role.get("Path") or "").startswith("/aws-service-role/"):
                 continue  # AWS-managed service-linked roles - not actionable, would just be noise
             for p in iam.list_attached_role_policies(RoleName=name).get("AttachedPolicies", []):
-                emit("role", name, p["PolicyName"], p["PolicyArn"], is_inline=False)
+                emit_attached("role", name, p)
             for policy_name in iam.list_role_policies(RoleName=name).get("PolicyNames", []):
-                emit("role", name, policy_name, None, is_inline=True)
+                emit_inline("role", name, policy_name)
     except ClientError as e:
         errors.append({"check": "iam_role_policies", "reason": _client_error_reason(e), "detail": str(e)})
 
@@ -260,9 +356,9 @@ def scan_iam_policy_bindings(iam, errors):
         for group in groups:
             name = group["GroupName"]
             for p in iam.list_attached_group_policies(GroupName=name).get("AttachedPolicies", []):
-                emit("group", name, p["PolicyName"], p["PolicyArn"], is_inline=False)
+                emit_attached("group", name, p)
             for policy_name in iam.list_group_policies(GroupName=name).get("PolicyNames", []):
-                emit("group", name, policy_name, None, is_inline=True)
+                emit_inline("group", name, policy_name)
     except ClientError as e:
         errors.append({"check": "iam_group_policies", "reason": _client_error_reason(e), "detail": str(e)})
 
@@ -326,7 +422,7 @@ def _fmt_ip_permission(perm):
     return f"{port_desc} from {', '.join(sources)}"
 
 
-def scan_security_groups(ec2, sensitive_ports, errors):
+def scan_security_groups(ec2, sensitive_ports, region, errors):
     resources = []
     sensitive_ports = {int(p) for p in sensitive_ports}
     try:
@@ -334,7 +430,7 @@ def scan_security_groups(ec2, sensitive_ports, errors):
         for page in ec2.get_paginator("describe_security_groups").paginate():
             sgs.extend(page.get("SecurityGroups", []))
     except ClientError as e:
-        errors.append({"check": "security_groups", "reason": _client_error_reason(e), "detail": str(e)})
+        errors.append({"check": f"security_groups[{region}]", "reason": _client_error_reason(e), "detail": str(e)})
         return resources
 
     for sg in sgs:
@@ -358,8 +454,9 @@ def scan_security_groups(ec2, sensitive_ports, errors):
 
         resources.append({
             "type": "aws.ec2.security_group",
-            "id": f"sg:{sg['GroupId']}",
+            "id": f"sg:{region}:{sg['GroupId']}",
             "attributes": {
+                "region": region,
                 "group_id": sg["GroupId"], "group_name": sg.get("GroupName"),
                 "vpc_id": sg.get("VpcId"), "description": sg.get("Description"),
                 "ingress_rules": [_fmt_ip_permission(p) for p in sg.get("IpPermissions", [])],
@@ -370,7 +467,7 @@ def scan_security_groups(ec2, sensitive_ports, errors):
     return resources
 
 
-def scan_ec2_key_pairs(ec2, errors):
+def scan_ec2_key_pairs(ec2, region, errors):
     """EC2 key pairs - AWS's closest equivalent to GCP's SSH key metadata,
     but narrower: this only lists the key-pair name/fingerprint registered
     at instance launch, not per-instance authorized_keys content (AWS has
@@ -379,14 +476,15 @@ def scan_ec2_key_pairs(ec2, errors):
     try:
         key_pairs = ec2.describe_key_pairs().get("KeyPairs", [])
     except ClientError as e:
-        errors.append({"check": "ec2_key_pairs", "reason": _client_error_reason(e), "detail": str(e)})
+        errors.append({"check": f"ec2_key_pairs[{region}]", "reason": _client_error_reason(e), "detail": str(e)})
         return resources
 
     for kp in key_pairs:
         resources.append({
             "type": "aws.ec2.key_pair",
-            "id": f"key_pair:{kp.get('KeyPairId')}",
+            "id": f"key_pair:{region}:{kp.get('KeyPairId')}",
             "attributes": {
+                "region": region,
                 "key_name": kp.get("KeyName"), "key_pair_id": kp.get("KeyPairId"),
                 "key_type": kp.get("KeyType"), "fingerprint": kp.get("KeyFingerprint"),
                 "create_time": _iso(kp.get("CreateTime")),
@@ -397,7 +495,7 @@ def scan_ec2_key_pairs(ec2, errors):
     return resources
 
 
-def scan_api_gateway_keys(apigateway, errors):
+def scan_api_gateway_keys(apigateway, region, errors):
     resources = []
     try:
         keys = []
@@ -412,14 +510,15 @@ def scan_api_gateway_keys(apigateway, errors):
             if not position:
                 break
     except ClientError as e:
-        errors.append({"check": "api_gateway_keys", "reason": _client_error_reason(e), "detail": str(e)})
+        errors.append({"check": f"api_gateway_keys[{region}]", "reason": _client_error_reason(e), "detail": str(e)})
         return resources
 
     for key in keys:
         resources.append({
             "type": "aws.apigateway.key",
-            "id": f"api_key:{key.get('id')}",
+            "id": f"api_key:{region}:{key.get('id')}",
             "attributes": {
+                "region": region,
                 "name": key.get("name"), "enabled": key.get("enabled"),
                 "created_date": _iso(key.get("createdDate")),
                 "stage_keys": key.get("stageKeys", []),
@@ -496,7 +595,7 @@ def scan_s3_bucket_exposure(s3, errors):
     return resources
 
 
-def scan_security_hub_findings(securityhub, errors):
+def scan_security_hub_findings(securityhub, region, errors):
     """Best-effort, same posture as GCP SCC: Security Hub often isn't
     enabled, which surfaces as a skipped check rather than a scan failure."""
     resources = []
@@ -513,7 +612,7 @@ def scan_security_hub_findings(securityhub, errors):
             if not next_token:
                 break
     except ClientError as e:
-        errors.append({"check": "security_hub_findings", "reason": _client_error_reason(e), "detail": str(e)})
+        errors.append({"check": f"security_hub_findings[{region}]", "reason": _client_error_reason(e), "detail": str(e)})
         return resources
 
     for f in findings:
@@ -522,8 +621,9 @@ def scan_security_hub_findings(securityhub, errors):
             severity = "info"
         resources.append({
             "type": "aws.securityhub.finding",
-            "id": f"finding:{f.get('Id')}",
+            "id": f"finding:{region}:{f.get('Id')}",
             "attributes": {
+                "region": region,
                 "title": f.get("Title"),
                 "resource_ids": [r.get("Id") for r in f.get("Resources", [])],
                 "workflow_state": (f.get("Workflow") or {}).get("Status"),
@@ -535,14 +635,14 @@ def scan_security_hub_findings(securityhub, errors):
     return resources
 
 
-def scan_access_analyzer_findings(accessanalyzer, errors):
+def scan_access_analyzer_findings(accessanalyzer, region, errors):
     """Best-effort, same posture as GCP IAM Recommender: no analyzer
     configured surfaces as an empty list plus a skipped check, not a crash."""
     resources = []
     try:
         analyzers = accessanalyzer.list_analyzers().get("analyzers", [])
     except ClientError as e:
-        errors.append({"check": "access_analyzer", "reason": _client_error_reason(e), "detail": str(e)})
+        errors.append({"check": f"access_analyzer[{region}]", "reason": _client_error_reason(e), "detail": str(e)})
         return resources
 
     for analyzer in analyzers:
@@ -559,7 +659,7 @@ def scan_access_analyzer_findings(accessanalyzer, errors):
                 if not next_token:
                     break
         except ClientError as e:
-            errors.append({"check": f"access_analyzer_findings:{analyzer.get('name')}", "reason": _client_error_reason(e), "detail": str(e)})
+            errors.append({"check": f"access_analyzer_findings[{region}]:{analyzer.get('name')}", "reason": _client_error_reason(e), "detail": str(e)})
             continue
 
         for finding in findings:
@@ -568,8 +668,9 @@ def scan_access_analyzer_findings(accessanalyzer, errors):
             is_public = bool(finding.get("isPublic"))
             resources.append({
                 "type": "aws.accessanalyzer.finding",
-                "id": f"finding:{finding.get('id')}",
+                "id": f"finding:{region}:{finding.get('id')}",
                 "attributes": {
+                    "region": region,
                     "resource": finding.get("resource"), "resource_type": finding.get("resourceType"),
                     "is_public": is_public, "condition": finding.get("condition"),
                 },
@@ -579,14 +680,14 @@ def scan_access_analyzer_findings(accessanalyzer, errors):
     return resources
 
 
-def scan_guardduty_findings(guardduty, errors):
+def scan_guardduty_findings(guardduty, region, errors):
     """Best-effort, same posture as Security Hub/SCC: no detector enabled
     in this region surfaces as an empty list plus a skipped check."""
     resources = []
     try:
         detector_ids = guardduty.list_detectors().get("DetectorIds", [])
     except ClientError as e:
-        errors.append({"check": "guardduty_detectors", "reason": _client_error_reason(e), "detail": str(e)})
+        errors.append({"check": f"guardduty_detectors[{region}]", "reason": _client_error_reason(e), "detail": str(e)})
         return resources
 
     for detector_id in detector_ids:
@@ -607,7 +708,7 @@ def scan_guardduty_findings(guardduty, errors):
                 if not next_token:
                     break
         except ClientError as e:
-            errors.append({"check": f"guardduty_list_findings:{detector_id}", "reason": _client_error_reason(e), "detail": str(e)})
+            errors.append({"check": f"guardduty_list_findings[{region}]:{detector_id}", "reason": _client_error_reason(e), "detail": str(e)})
             continue
 
         # GetFindings caps out at 50 IDs per call.
@@ -616,7 +717,7 @@ def scan_guardduty_findings(guardduty, errors):
             try:
                 details = guardduty.get_findings(DetectorId=detector_id, FindingIds=batch).get("Findings", [])
             except ClientError as e:
-                errors.append({"check": f"guardduty_get_findings:{detector_id}", "reason": _client_error_reason(e), "detail": str(e)})
+                errors.append({"check": f"guardduty_get_findings[{region}]:{detector_id}", "reason": _client_error_reason(e), "detail": str(e)})
                 continue
 
             for f in details:
@@ -625,8 +726,9 @@ def scan_guardduty_findings(guardduty, errors):
                 severity = "high" if score >= 7.0 else "medium" if score >= 4.0 else "low"
                 resources.append({
                     "type": "aws.guardduty.finding",
-                    "id": f"finding:{f.get('Id')}",
+                    "id": f"finding:{region}:{f.get('Id')}",
                     "attributes": {
+                        "region": region,
                         "title": f.get("Title"),
                         "finding_type": f.get("Type"),
                         "severity_score": score,
@@ -708,12 +810,11 @@ def scan_resource_explorer_inventory(resourceexplorer, errors):
     all. Resource Explorer is opt-in and needs an admin to turn on
     indexing first, so an account/region without it configured degrades to
     a skipped check, not a crash - same best-effort posture as Security
-    Hub/GuardDuty/Access Analyzer. When it *is* enabled, this is the only
-    check in the scanner that sees resources outside the single configured
-    `aws.region` - it reports what exists in every indexed region, as a
-    per-(resource type, region) count, so the report can flag "there are
-    resources in regions this scan didn't otherwise look at" without
-    requiring a full multi-region rescan."""
+    Hub/GuardDuty/Access Analyzer. It reports what exists in every indexed
+    region as a single global call, as a per-(resource type, region) count,
+    independent of `aws.regions` - useful as a cross-check that the
+    region-scoped checks (which loop `aws.regions`) aren't missing a region
+    with real resources in it."""
     resources = []
     try:
         view_arn = resourceexplorer.get_default_view().get("ViewArn")
@@ -816,7 +917,7 @@ def scan_cloudtrail_config(cloudtrail, errors):
     return resources
 
 
-def scan_config_recorder(configservice, errors):
+def scan_config_recorder(configservice, region, errors):
     """AWS Config's configuration recorder - no recorder at all, or one
     that's provisioned but not actively recording, means no continuous
     resource-configuration history exists for the account/region."""
@@ -824,14 +925,14 @@ def scan_config_recorder(configservice, errors):
     try:
         recorders = configservice.describe_configuration_recorders().get("ConfigurationRecorders", [])
     except ClientError as e:
-        errors.append({"check": "config_recorders", "reason": _client_error_reason(e), "detail": str(e)})
+        errors.append({"check": f"config_recorders[{region}]", "reason": _client_error_reason(e), "detail": str(e)})
         return resources
 
     if not recorders:
         resources.append({
             "type": "aws.config.recorder",
-            "id": "config_recorder:none",
-            "attributes": {"name": None, "recording": False},
+            "id": f"config_recorder:{region}:none",
+            "attributes": {"region": region, "name": None, "recording": False},
             "severity": "medium",
             "tags": ["config", "no-recorder"],
         })
@@ -840,7 +941,7 @@ def scan_config_recorder(configservice, errors):
     try:
         statuses = {s["name"]: s for s in configservice.describe_configuration_recorder_status().get("ConfigurationRecordersStatus", [])}
     except ClientError as e:
-        errors.append({"check": "config_recorder_status", "reason": _client_error_reason(e), "detail": str(e)})
+        errors.append({"check": f"config_recorder_status[{region}]", "reason": _client_error_reason(e), "detail": str(e)})
         statuses = {}
 
     for recorder in recorders:
@@ -850,8 +951,9 @@ def scan_config_recorder(configservice, errors):
         recording_group = recorder.get("recordingGroup", {})
         resources.append({
             "type": "aws.config.recorder",
-            "id": f"config_recorder:{name}",
+            "id": f"config_recorder:{region}:{name}",
             "attributes": {
+                "region": region,
                 "name": name,
                 "recording": recording,
                 "all_supported": recording_group.get("allSupported"),
@@ -908,7 +1010,7 @@ def scan_iam_password_policy(iam, errors):
     return resources
 
 
-def scan_kms_key_rotation(kms, errors):
+def scan_kms_key_rotation(kms, region, errors):
     """Customer-managed KMS keys with automatic rotation disabled - the AWS
     analog of the GCP Cloud KMS rotation check. AWS-managed keys (KeyManager
     == "AWS") are skipped since the account doesn't control their rotation
@@ -919,14 +1021,14 @@ def scan_kms_key_rotation(kms, errors):
         for page in kms.get_paginator("list_keys").paginate():
             key_ids.extend(k["KeyId"] for k in page.get("Keys", []))
     except ClientError as e:
-        errors.append({"check": "kms_list_keys", "reason": _client_error_reason(e), "detail": str(e)})
+        errors.append({"check": f"kms_list_keys[{region}]", "reason": _client_error_reason(e), "detail": str(e)})
         return resources
 
     for key_id in key_ids:
         try:
             meta = kms.describe_key(KeyId=key_id).get("KeyMetadata", {})
         except ClientError as e:
-            errors.append({"check": f"kms_describe_key:{key_id}", "reason": _client_error_reason(e), "detail": str(e)})
+            errors.append({"check": f"kms_describe_key[{region}]:{key_id}", "reason": _client_error_reason(e), "detail": str(e)})
             continue
 
         if meta.get("KeyManager") != "CUSTOMER" or meta.get("KeyState") != "Enabled":
@@ -937,12 +1039,13 @@ def scan_kms_key_rotation(kms, errors):
             try:
                 rotation_enabled = kms.get_key_rotation_status(KeyId=key_id).get("KeyRotationEnabled")
             except ClientError as e:
-                errors.append({"check": f"kms_rotation_status:{key_id}", "reason": _client_error_reason(e), "detail": str(e)})
+                errors.append({"check": f"kms_rotation_status[{region}]:{key_id}", "reason": _client_error_reason(e), "detail": str(e)})
 
         resources.append({
             "type": "aws.kms.key",
-            "id": f"kms_key:{key_id}",
+            "id": f"kms_key:{region}:{key_id}",
             "attributes": {
+                "region": region,
                 "key_id": key_id,
                 "description": meta.get("Description"),
                 "key_spec": meta.get("KeySpec"),
@@ -954,7 +1057,7 @@ def scan_kms_key_rotation(kms, errors):
     return resources
 
 
-def scan_rds_instances(rds, errors):
+def scan_rds_instances(rds, region, errors):
     """RDS instance exposure - the AWS analog of the GCP Cloud SQL check:
     flags publicly-accessible instances and unencrypted storage."""
     resources = []
@@ -963,7 +1066,7 @@ def scan_rds_instances(rds, errors):
         for page in rds.get_paginator("describe_db_instances").paginate():
             instances.extend(page.get("DBInstances", []))
     except ClientError as e:
-        errors.append({"check": "rds_instances", "reason": _client_error_reason(e), "detail": str(e)})
+        errors.append({"check": f"rds_instances[{region}]", "reason": _client_error_reason(e), "detail": str(e)})
         return resources
 
     for inst in instances:
@@ -982,8 +1085,9 @@ def scan_rds_instances(rds, errors):
 
         resources.append({
             "type": "aws.rds.instance",
-            "id": f"rds_instance:{identifier}",
+            "id": f"rds_instance:{region}:{identifier}",
             "attributes": {
+                "region": region,
                 "identifier": identifier,
                 "engine": inst.get("Engine"),
                 "publicly_accessible": publicly_accessible,
@@ -995,7 +1099,7 @@ def scan_rds_instances(rds, errors):
     return resources
 
 
-def scan_ebs_default_encryption(ec2, errors):
+def scan_ebs_default_encryption(ec2, region, errors):
     """EBS encryption-by-default is a single per-region account setting -
     when off, every newly-created volume that doesn't explicitly request
     encryption is created unencrypted."""
@@ -1003,20 +1107,20 @@ def scan_ebs_default_encryption(ec2, errors):
     try:
         enabled = ec2.get_ebs_encryption_by_default().get("EbsEncryptionByDefault", False)
     except ClientError as e:
-        errors.append({"check": "ebs_default_encryption", "reason": _client_error_reason(e), "detail": str(e)})
+        errors.append({"check": f"ebs_default_encryption[{region}]", "reason": _client_error_reason(e), "detail": str(e)})
         return resources
 
     resources.append({
         "type": "aws.ec2.ebs_default_encryption",
-        "id": "ebs_default_encryption",
-        "attributes": {"enabled": enabled},
+        "id": f"ebs_default_encryption:{region}",
+        "attributes": {"region": region, "enabled": enabled},
         "severity": "medium" if not enabled else "info",
         "tags": ["ec2"] + ([] if enabled else ["disabled"]),
     })
     return resources
 
 
-def scan_vpc_flow_logs(ec2, errors):
+def scan_vpc_flow_logs(ec2, region, errors):
     """Flags VPCs with no active Flow Log - without one, there's no record
     of network traffic to investigate after an incident."""
     resources = []
@@ -1025,7 +1129,7 @@ def scan_vpc_flow_logs(ec2, errors):
         for page in ec2.get_paginator("describe_vpcs").paginate():
             vpcs.extend(page.get("Vpcs", []))
     except ClientError as e:
-        errors.append({"check": "vpc_list", "reason": _client_error_reason(e), "detail": str(e)})
+        errors.append({"check": f"vpc_list[{region}]", "reason": _client_error_reason(e), "detail": str(e)})
         return resources
 
     try:
@@ -1033,7 +1137,7 @@ def scan_vpc_flow_logs(ec2, errors):
         for page in ec2.get_paginator("describe_flow_logs").paginate():
             flow_logs.extend(page.get("FlowLogs", []))
     except ClientError as e:
-        errors.append({"check": "vpc_flow_logs", "reason": _client_error_reason(e), "detail": str(e)})
+        errors.append({"check": f"vpc_flow_logs[{region}]", "reason": _client_error_reason(e), "detail": str(e)})
         flow_logs = []
 
     vpcs_with_active_flow_logs = {
@@ -1045,12 +1149,26 @@ def scan_vpc_flow_logs(ec2, errors):
         has_flow_log = vpc_id in vpcs_with_active_flow_logs
         resources.append({
             "type": "aws.ec2.vpc",
-            "id": f"vpc:{vpc_id}",
-            "attributes": {"vpc_id": vpc_id, "is_default": vpc.get("IsDefault"), "has_flow_log": has_flow_log},
+            "id": f"vpc:{region}:{vpc_id}",
+            "attributes": {"region": region, "vpc_id": vpc_id, "is_default": vpc.get("IsDefault"), "has_flow_log": has_flow_log},
             "severity": "medium" if not has_flow_log else "info",
             "tags": ["network", "vpc"] + ([] if has_flow_log else ["no-flow-log"]),
         })
     return resources
+
+
+def _discover_regions(session, errors):
+    """Every region enabled for this account, via ec2:DescribeRegions with
+    no AllRegions override - that default already excludes opt-in regions
+    the account hasn't turned on, so it's exactly "every region this
+    account could plausibly have resources in" without the noise of
+    regions like ap-east-1/me-south-1 that were never opted into."""
+    try:
+        ec2 = session.client("ec2", region_name=DEFAULT_REGION)
+        return sorted(r["RegionName"] for r in ec2.describe_regions().get("Regions", []))
+    except ClientError as e:
+        errors.append({"check": "region_discovery", "reason": _client_error_reason(e), "detail": str(e)})
+        return [DEFAULT_REGION]
 
 
 def scan(config, errors):
@@ -1067,8 +1185,7 @@ def scan(config, errors):
         errors.append({"check": "aws_auth", "reason": "INVALID_CREDENTIALS_FILE", "detail": str(e)})
         return [], "error"
 
-    region = aws_cfg.get("region", DEFAULT_REGION)
-    session = boto3.Session(aws_access_key_id=access_key_id, aws_secret_access_key=secret_access_key, region_name=region)
+    session = boto3.Session(aws_access_key_id=access_key_id, aws_secret_access_key=secret_access_key, region_name=DEFAULT_REGION)
 
     try:
         session.client("sts").get_caller_identity()
@@ -1095,37 +1212,42 @@ def scan(config, errors):
         resources += scan_iam_access_advisor(iam, errors)
     if checks_cfg.get("password_policy", True):
         resources += scan_iam_password_policy(iam, errors)
-
-    ec2 = session.client("ec2")
-    if checks_cfg.get("security_groups", True):
-        resources += scan_security_groups(ec2, aws_cfg.get("sensitive_ports", [22, 3389, 3306, 5432]), errors)
-    if checks_cfg.get("ec2_key_pairs", True):
-        resources += scan_ec2_key_pairs(ec2, errors)
-    if checks_cfg.get("ebs_default_encryption", True):
-        resources += scan_ebs_default_encryption(ec2, errors)
-    if checks_cfg.get("vpc_flow_logs", True):
-        resources += scan_vpc_flow_logs(ec2, errors)
-
     if checks_cfg.get("s3_bucket_exposure", True):
         resources += scan_s3_bucket_exposure(session.client("s3"), errors)
-    if checks_cfg.get("api_gateway_keys", True):
-        resources += scan_api_gateway_keys(session.client("apigateway"), errors)
-    if checks_cfg.get("security_hub", True):
-        resources += scan_security_hub_findings(session.client("securityhub"), errors)
-    if checks_cfg.get("access_analyzer", True):
-        resources += scan_access_analyzer_findings(session.client("accessanalyzer"), errors)
-    if checks_cfg.get("guardduty", True):
-        resources += scan_guardduty_findings(session.client("guardduty"), errors)
-    if checks_cfg.get("resource_explorer", True):
-        resources += scan_resource_explorer_inventory(session.client("resource-explorer-2"), errors)
     if checks_cfg.get("cloudtrail", True):
         resources += scan_cloudtrail_config(session.client("cloudtrail"), errors)
-    if checks_cfg.get("config_recorder", True):
-        resources += scan_config_recorder(session.client("config"), errors)
-    if checks_cfg.get("kms_key_rotation", True):
-        resources += scan_kms_key_rotation(session.client("kms"), errors)
-    if checks_cfg.get("rds_instances", True):
-        resources += scan_rds_instances(session.client("rds"), errors)
+    if checks_cfg.get("resource_explorer", True):
+        resources += scan_resource_explorer_inventory(session.client("resource-explorer-2"), errors)
+
+    regions = aws_cfg.get("regions") or []
+    if not regions:
+        regions = _discover_regions(session, errors)
+
+    sensitive_ports = aws_cfg.get("sensitive_ports", [22, 3389, 3306, 5432])
+    for region in regions:
+        ec2 = session.client("ec2", region_name=region)
+        if checks_cfg.get("security_groups", True):
+            resources += scan_security_groups(ec2, sensitive_ports, region, errors)
+        if checks_cfg.get("ec2_key_pairs", True):
+            resources += scan_ec2_key_pairs(ec2, region, errors)
+        if checks_cfg.get("ebs_default_encryption", True):
+            resources += scan_ebs_default_encryption(ec2, region, errors)
+        if checks_cfg.get("vpc_flow_logs", True):
+            resources += scan_vpc_flow_logs(ec2, region, errors)
+        if checks_cfg.get("api_gateway_keys", True):
+            resources += scan_api_gateway_keys(session.client("apigateway", region_name=region), region, errors)
+        if checks_cfg.get("security_hub", True):
+            resources += scan_security_hub_findings(session.client("securityhub", region_name=region), region, errors)
+        if checks_cfg.get("access_analyzer", True):
+            resources += scan_access_analyzer_findings(session.client("accessanalyzer", region_name=region), region, errors)
+        if checks_cfg.get("guardduty", True):
+            resources += scan_guardduty_findings(session.client("guardduty", region_name=region), region, errors)
+        if checks_cfg.get("config_recorder", True):
+            resources += scan_config_recorder(session.client("config", region_name=region), region, errors)
+        if checks_cfg.get("kms_key_rotation", True):
+            resources += scan_kms_key_rotation(session.client("kms", region_name=region), region, errors)
+        if checks_cfg.get("rds_instances", True):
+            resources += scan_rds_instances(session.client("rds", region_name=region), region, errors)
 
     status = "ok" if not errors else "partial"
     return resources, status

@@ -26,7 +26,7 @@ One JSON file per **provider** per run, written to `.state/snapshots/<provider>/
 }
 ```
 
-`status` is one of `ok` (no errors), `partial` (some checks failed but others succeeded), `skipped` (provider has no credentials configured — Trello only), or `error` (nothing could run, e.g. auth failure).
+`status` is one of `ok` (no errors), `partial` (some checks failed but others succeeded), `skipped` (provider has no credentials configured — Trello, Google Workspace, and Confluence can all return this), or `error` (nothing could run, e.g. auth failure).
 
 ## Resource identity
 

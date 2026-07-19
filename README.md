@@ -15,7 +15,7 @@ See [`SKILL.md`](.claude/skills/soc2/SKILL.md) for the full skill documentation.
 | **Bitbucket** | Repos, per-repo access levels, deploy keys, project access keys, account SSH keys, webhooks, branch restrictions (incl. merge checks) |
 | **Trello** | Organization-level membership (admin/normal, deactivated/unconfirmed accounts), boards (visibility, staleness), board members grouped by member with every board + permission level nested underneath |
 | **Google Workspace** | User directory via domain-wide delegation (reuses the GCP service account, no new credential): suspended/admin/2FA status, dormant-but-active accounts, super-admin-count summary; groups, org units, mobile device posture; Reports-API-derived Suspicious Login Events and OAuth App Grants |
-| **Confluence** | Space permissions with full operation-level granularity (e.g. `create:page` vs `create:comment`, not just `create`), group grants resolved to real member accounts (not left as an opaque group name), anonymous/public access flagged critical. Can be narrowed to one `main_space` of interest instead of enumerating a whole 1000+-space fleet |
+| **Confluence** | Space permissions with full operation-level granularity (e.g. `create:page` vs `create:comment`, not just `create`), anonymous/public access flagged critical. Can be narrowed to one `main_space` of interest instead of enumerating a whole 1000+-space fleet — when narrowed, that space's group grants are also resolved to real member accounts instead of left as an opaque group name |
 
 Every check is independently fault-tolerant — a missing permission or disabled API degrades that one check to a "skipped" entry in the report instead of crashing the whole scan. See [`SKILL.md`](.claude/skills/soc2/SKILL.md) for the full, current list of checks and how the report is organized.
 
@@ -24,7 +24,7 @@ A few report-quality details worth knowing about since they aren't obvious from 
 - **Identity grouping uses the provider's real unique ID, never a display name.** Trello's `full_name` in particular is free-text with no uniqueness constraint - this workspace has multiple distinct accounts sharing a display name , so grouping by name alone would silently merge unrelated accounts' access into one row. Each member's own username is shown alongside their name to disambiguate, and near-namesakes differing only in case/punctuation still sort next to each other.
 - **Staleness and privilege are color-coded in the Markdown report**, not just left as plain values: stale passwords/keys/activity dates (context-dependent thresholds - 90/180 days for keys, 6 months for AWS console passwords, 3 months for Trello activity) render red; `admin`-level permissions render red; closed/archived/disabled resources render on a gray background.
 - **Large, low-signal fleets of near-duplicate resources can be folded into a collapsible section** in the Markdown report (any chapter can declare `collapsible_groups`) so hundreds of same-pattern resources (e.g. per-customer storage buckets) don't drown out the handful of genuinely distinct ones - the full detail is still there, just collapsed by default.
-- **Confluence's group grants are resolved to real member accounts**, not left as an opaque `group:administrators` placeholder — the report shows exactly who inherits access and through which group(s), with deactivated users set apart in their own grayed-out, severity-muted subsection rather than mixed in with active accounts.
+- **Confluence's group grants are resolved to real member accounts when `confluence.main_space` is configured**, not left as an opaque `group:administrators` placeholder — for that space, the report shows exactly who inherits access and through which group(s), with deactivated users set apart in their own grayed-out, severity-muted subsection rather than mixed in with active accounts. Every other space (when `main_space` isn't set, or for spaces other than it) keeps group grants as an opaque group name.
 
 ## Quick start
 
@@ -39,11 +39,11 @@ A few report-quality details worth knowing about since they aren't obvious from 
    - `secrets/id-atlassian-confluence-token.txt` — Confluence API token, same Atlassian account family as Bitbucket ([setup](.claude/skills/soc2/references/confluence_setup.md))
    - `secrets/trello-credentials.json` — `{"api_key": "...", "token": "..."}` ([setup](.claude/skills/soc2/references/trello_setup.md))
    - `secrets/aws-access-keys.csv` — CSV from IAM > Users > Security credentials > Create access key ([setup](.claude/skills/soc2/references/aws_setup.md))
-   - `secrets/soc2.config.private.yaml` — company-identifying values that shouldn't be in the committed config (workspace names, hardcoded manual-review URLs, name-highlight patterns, and the shared delegated-admin email used inline by `gsuite.delegated_admin_email`/`bitbucket.account_email`/`confluence.account_email` — one identity, one value, not three copies). Deep-merged onto `config/soc2.config.yaml` at load time; see [field-by-field breakdown below](#secretssoc2configprivateyaml-fields).
+   - `secrets/soc2.config.private.yaml` — company-identifying values that shouldn't be in the committed config (workspace names, hardcoded manual-review URLs, name-highlight patterns, and the shared delegated-admin email used inline by `gsuite.delegated_admin_email`/`bitbucket.account_email`/`confluence.account_email` — one identity, one value, not three copies). Deep-merged onto `config/soc2.config.yaml` at load time; see [field-by-field breakdown below](#secretssoc2configprivateyaml-fields). Alternatively, that shared email can live in its own gitignored file, `secrets/delegated-admin-email.txt`, via the `gsuite.delegated_admin_email_path`/`bitbucket.account_email_path`/`confluence.account_email_path` config keys instead — each provider prefers its `_path` variant over the inline value when the file exists.
 
    All six providers use read-only credentials by design (GCP viewer-tier IAM roles, AWS's `SecurityAudit` managed policy, scoped Bitbucket/Confluence tokens, a domain-wide-delegation scope set that was empirically confirmed to reject write calls) — the scanner never needs write access to do its job.
 
-3. **Review non-secret settings** in [`config/soc2.config.yaml`](config/soc2.config.yaml): which GCP projects/Bitbucket workspaces/AWS region to scan, per-check on/off flags, and severity thresholds.
+3. **Review non-secret settings** in [`config/soc2.config.yaml`](config/soc2.config.yaml): which GCP projects/Bitbucket workspaces/Trello organizations to scan, which AWS regions the region-scoped checks should cover (empty `aws.regions` = every region enabled for the account), which Confluence spaces to check (or narrow to one `main_space`), per-check on/off flags, and severity thresholds.
 
 4. **(GCP only) Run the permission pre-flight probe** so missing permissions or disabled APIs show up as a clear table instead of a crash mid-scan:
    ```
@@ -61,7 +61,7 @@ A few report-quality details worth knowing about since they aren't obvious from 
 ## Output
 
 - **Console** — fixed provider order (GCP → Bitbucket → Trello → AWS → Google Workspace → Confluence), organized into per-resource-type chapters rather than one flat list.
-- **JSON snapshots** — `.state/snapshots/<provider>/<provider>-<timestamp>.json`, one per provider per run, diffed against that provider's own most recent prior snapshot. Schema documented in [`snapshot_schema.md`](.claude/skills/soc2/references/snapshot_schema.md).
+- **JSON snapshots** — `.state/snapshots/<provider>/<provider>-<timestamp>.json`, one per provider per run, diffed against that provider's own most recent prior snapshot. **Unlike reports below, old snapshots are pruned automatically** — only the most recent `output.snapshot_retention_count` (default 20) are kept per provider. Schema documented in [`snapshot_schema.md`](.claude/skills/soc2/references/snapshot_schema.md).
 - **Markdown report** — `reports/soc2-report-<scope>-<timestamp>.md`: executive summary, a table of contents, per-provider chapters, and a diff-since-last-scan table. **Old reports are never deleted automatically** — every run adds a new timestamped file so the directory doubles as a compliance evidence trail.
 
 ## `secrets/soc2.config.private.yaml` fields
@@ -71,20 +71,23 @@ This file is deep-merged onto `config/soc2.config.yaml` at load time (`common/co
 | Key | Type | Used by | What it's for |
 |---|---|---|---|
 | `bitbucket.account_email` | string | Bitbucket (`auth_mode: basic_email`) | The real account's email for Basic auth. Shared value with `gsuite.delegated_admin_email` / `confluence.account_email` below - same person, set once conceptually, three times in the file since each provider reads its own key. |
+| `bitbucket.account_email_path` | string, optional | Bitbucket (`auth_mode: basic_email`) | Alternative to `bitbucket.account_email`: path to a gitignored file (defaults to `secrets/delegated-admin-email.txt`) containing just the email. Preferred over the inline value when the file exists. |
 | `bitbucket.workspaces` | list of strings | Bitbucket | Which workspace(s) to scan. Bitbucket's token type here can't auto-discover workspaces (`GET /2.0/workspaces` is deprecated platform-wide - see `references/bitbucket_setup.md`), so this must be pinned explicitly. |
 | `bitbucket.manual_review_urls` | list of strings | Bitbucket (report only) | URLs shown under "Manual review required" in the report for things Bitbucket's API can't expose at all (Access Tokens, SSH keys/OAuth clients/applications/access-controls pages) - workspace-specific, so hardcoded per-company rather than in the public config. |
 | `gcp.manual_review_urls` | list of strings | GCP (report only) | Same idea as Bitbucket's - project-specific console URLs for things with no public API (OAuth 2.0 Client IDs on the Credentials page, etc). |
 | `gcp.firewall_name_highlights` | list of strings | GCP | Substrings/prefixes of firewall rule or network names to highlight (green) in the Firewall Rules table - useful for calling out this company's specific fleet/network naming conventions. |
 | `gcp.storage_bucket_collapsible_groups` | list of `{label, prefix}` or `{label, substrings: [...]}` | GCP | Folds large, low-signal fleets of same-pattern storage buckets (e.g. hundreds of per-customer buckets sharing a naming convention) into a collapsible `<details>` section in the Storage Bucket Config chapter, instead of drowning out the genuinely distinct ones. `prefix` is a startswith match; `substrings` is any-of. |
 | `gsuite.delegated_admin_email` | string | Google Workspace | The Workspace user to impersonate via domain-wide delegation for Admin SDK calls - must already be authorized for this service account's Client ID in the Workspace Admin Console (see `references/gsuite_setup.md`). Shared value with `bitbucket.account_email` / `confluence.account_email`. |
+| `gsuite.delegated_admin_email_path` | string, optional | Google Workspace | Alternative to `gsuite.delegated_admin_email`: path to a gitignored file (defaults to `secrets/delegated-admin-email.txt`) containing just the email. Preferred over the inline value when the file exists. |
 | `confluence.cloud_id` | string | Confluence | The site's Atlassian Cloud ID, required to route requests through the centralized API gateway (`api.atlassian.com/ex/confluence/{cloud_id}/...`) instead of the site's own domain. How to find it (via an unauthenticated redirect chain) is documented in `references/confluence_setup.md`. |
 | `confluence.main_space` | string, optional | Confluence | Narrows the scan to one space key (e.g. `"PRD"`) instead of enumerating every space this account can see (1000+ in a typical instance). When set, that one space gets full per-user permission detail (including group grants resolved to real members) and every other space collapses into a single "N other authorized spaces" note. Leave unset to fall back to listing every space with just its admins. |
 | `confluence.account_email` | string | Confluence (Basic auth) | Same shared identity as `bitbucket.account_email` above. |
+| `confluence.account_email_path` | string, optional | Confluence (Basic auth) | Alternative to `confluence.account_email`: path to a gitignored file (defaults to `secrets/delegated-admin-email.txt`) containing just the email. Preferred over the inline value when the file exists. |
 
 ## Project structure
 
 ```
-config/soc2.config.yaml          # non-secret settings (which projects/workspaces/region, check toggles) - safe to make public
+config/soc2.config.yaml          # non-secret settings (which projects/workspaces/regions, check toggles) - safe to make public
 secrets/                         # credentials — gitignored, never committed
 secrets/soc2.config.private.yaml # company-identifying values deep-merged onto config/soc2.config.yaml - gitignored
 .state/snapshots/<provider>/     # JSON snapshots per run — gitignored
@@ -165,11 +168,11 @@ Permissions:
 
 #### Firewall Rules (enabled)
 
-| Severity | Name | Network | Direction | Source Ranges | Ports |
+| Severity | Name | Direction | Source Ranges | Allowed | Network |
 |---|---|---|---|---|---|
-| **<span style="color:darkred; text-decoration:underline">critical</span>** | allow-all-ssh | default | INGRESS | 0.0.0.0/0 | tcp:22(ssh) |
-| **<span style="color:red">high</span>** | allow-web | prod-vpc | INGRESS | 0.0.0.0/0 | tcp:80(http), tcp:443(https) |
-| info | allow-internal | prod-vpc | INGRESS | 10.0.0.0/8 | tcp:443(https) |
+| **<span style="color:darkred; text-decoration:underline">critical</span>** | allow-all-ssh | INGRESS | 0.0.0.0/0 | tcp:22(ssh) | default |
+| **<span style="color:red">high</span>** | allow-web | INGRESS | 0.0.0.0/0 | tcp:80(http); tcp:443(https) | prod-vpc |
+| info | allow-internal | INGRESS | 10.0.0.0/8 | tcp:443(https) | prod-vpc |
 
 #### Security Command Center Findings (438 findings across 6 resource groups, 3 sections)
 

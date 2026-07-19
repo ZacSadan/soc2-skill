@@ -92,7 +92,7 @@ def run_aws(config, run_id):
     started_at = _timestamp()
     errors = []
     resources, status = aws_scanner.scan(config, errors)
-    target = {"region": config["aws"].get("region", "us-east-1")}
+    target = {"regions": config["aws"].get("regions") or []}  # empty = every region enabled for the account
     return _make_snapshot("aws", run_id, started_at, target, status, resources, errors)
 
 
