@@ -1,5 +1,6 @@
 # Secrets - never commit
-/secrets/
+/secrets/*
+!/secrets/.gitkeep
 key-*.txt
 key-*.json
 *.pem
@@ -13,7 +14,8 @@ key-*.json
 
 # Scan state and generated reports - contain sensitive inventory data
 /.state/
-/reports/
+/reports/*
+!/reports/.gitkeep
 
 # Python
 .venv/
