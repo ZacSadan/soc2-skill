@@ -4,6 +4,8 @@ A Claude Code skill that audits the security posture of **GCP, Bitbucket, Trello
 
 The scanner and all its logic live under [`.claude/skills/soc2/`](.claude/skills/soc2/) as a self-contained Claude Code skill — this repo is a working install of that skill plus its config and (gitignored) credentials.
 
+See [`SKILL.md`](.claude/skills/soc2/SKILL.md) for the full skill documentation.
+
 ## What it checks
 
 | Provider | Highlights |
